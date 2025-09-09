@@ -307,14 +307,16 @@ export default function LegacyBindings() {
         state.estOut = out;
 
         const sFrom = state.meta[from]?.symbol || "";
-        const sTo = state.meta[to]?.symbol || "";
+        const sTo   = state.meta[to]?.symbol   || "";
         payTag.textContent = `${fmtNum(amt)} ${sFrom}`;
         getTag.textContent = `${fmtNum(out)} ${sTo}`;
 
-        // --- Tolerance affichée = slippage utilisateur + 0.2% de frais ---
+        // --- PATCH: intégrer la fee 0,2% dans l’aperçu du minOut ---
+        const feePct = 0.2; // 0.2% de frais UPAY (0.1% LP + 0.1% burn)
         const slip = slipSel()?.value || "3";
-        const feePct = 0.2;
         const sNum = Number(slip) || 0;
+
+        // facteur effectif = 1 - (slippage + fee)/100
         const effTol = sNum + feePct;
         const factor = Math.max(0, 1 - effTol / 100);
         const minOutPreview = out * factor;
@@ -328,7 +330,7 @@ export default function LegacyBindings() {
             ` (~ minOut ≈ ${fmtNum(minOutPreview)} ${sTo})` +
             feeInfo;
         }
-
+        // --- fin patch aperçu ---
         if (b) b.disabled = false;
       }
 
@@ -495,21 +497,25 @@ export default function LegacyBindings() {
             setStatus("Approved ✔");
           }
 
-          // minOut (slippage + 0.2% fee)
+          // --- PATCH: minOut = slippage + fee 0.2% ---
           let minOut = 0n;
           const slip = slipSel()?.value || "3";
           if (slip !== "nolimit") {
             const ercOut = new Contract(tokenOut, ERC20_ABI, signer);
             const dOut: number = await ercOut.decimals();
+
             const estOut = Number(state.estOut || 0);
-            const feePct = 0.2;
-            const sNum = Number(slip) || 0;
-            const effTol = sNum + feePct;
+            const feePct = 0.2;           // 0.2% UPAY fees
+            const sNum   = Number(slip) || 0;
+            const effTol = sNum + feePct; // tolérance effective = slippage + 0.2%
             const factor = Math.max(0, 1 - effTol / 100);
+
             const minOutHuman = estOut * factor;
-            if (isFinite(minOutHuman) && minOutHuman > 0)
+            if (isFinite(minOutHuman) && minOutHuman > 0) {
               minOut = parseUnits(String(minOutHuman), dOut);
+            }
           }
+          // --- fin patch ---
 
           // Envoi direct (sans estimateGas)
           setStatus("Swapping…");
@@ -529,7 +535,7 @@ export default function LegacyBindings() {
           alert("✅ Swap executed\n" + `${EXPLORER_WEB}/tx/${tx.hash}`);
         } catch (e: any) {
           if (e?.message !== "busy")
-            alert(⚠️ " + (e?.reason || e?.message || String(e)));
+            alert("⚠️ " + (e?.reason || e?.message || String(e)));
         } finally {
           state.isSwapping = false;
           const b = btnSwap();
