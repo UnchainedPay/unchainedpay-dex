@@ -19,7 +19,7 @@ function i(v: any, def: number | null = 0) {
 function toFloat(v: any, decimals: number | null) {
   try {
     if (v == null) return null;
-    const d = Math.max(0, i(decimals ?? 18, 18));
+    const d = Math.max(0, Number(decimals ?? 18));
     const s = String(v);
     if (/^\d+$/.test(s)) {
       if (d === 0) return Number(s);
