@@ -311,14 +311,23 @@ export default function LegacyBindings() {
         payTag.textContent = `${fmtNum(amt)} ${sFrom}`;
         getTag.textContent = `${fmtNum(out)} ${sTo}`;
 
+        // --- Tolerance affichée = slippage utilisateur + 0.2% de frais ---
         const slip = slipSel()?.value || "3";
+        const feePct = 0.2;
+        const sNum = Number(slip) || 0;
+        const effTol = sNum + feePct;
+        const factor = Math.max(0, 1 - effTol / 100);
+        const minOutPreview = out * factor;
+
         const feeInfo = " | Fee: 0.2% per swap (0.1% to UPAY LP, 0.1% UPAY burn)";
-        if (slip === "nolimit")
+        if (slip === "nolimit") {
           slipInfo.textContent = "Tolerance: unlimited" + feeInfo;
-        else
-          slipInfo.textContent = `Tolerance: ${slip}% (~ minOut ≈ ${fmtNum(
-            out * (1 - Number(slip) / 100)
-          )} ${sTo})` + feeInfo;
+        } else {
+          slipInfo.textContent =
+            `Tolerance: ${sNum}% (+0.2% fee → effective ${effTol.toFixed(2)}%)` +
+            ` (~ minOut ≈ ${fmtNum(minOutPreview)} ${sTo})` +
+            feeInfo;
+        }
 
         if (b) b.disabled = false;
       }
@@ -486,14 +495,17 @@ export default function LegacyBindings() {
             setStatus("Approved ✔");
           }
 
-          // minOut (slippage)
+          // minOut (slippage + 0.2% fee)
           let minOut = 0n;
           const slip = slipSel()?.value || "3";
           if (slip !== "nolimit") {
             const ercOut = new Contract(tokenOut, ERC20_ABI, signer);
             const dOut: number = await ercOut.decimals();
             const estOut = Number(state.estOut || 0);
-            const factor = Math.max(0, 1 - Number(slip) / 100);
+            const feePct = 0.2;
+            const sNum = Number(slip) || 0;
+            const effTol = sNum + feePct;
+            const factor = Math.max(0, 1 - effTol / 100);
             const minOutHuman = estOut * factor;
             if (isFinite(minOutHuman) && minOutHuman > 0)
               minOut = parseUnits(String(minOutHuman), dOut);
@@ -517,7 +529,7 @@ export default function LegacyBindings() {
           alert("✅ Swap executed\n" + `${EXPLORER_WEB}/tx/${tx.hash}`);
         } catch (e: any) {
           if (e?.message !== "busy")
-            alert("⚠️ " + (e?.reason || e?.message || String(e)));
+            alert(⚠️ " + (e?.reason || e?.message || String(e)));
         } finally {
           state.isSwapping = false;
           const b = btnSwap();
