@@ -1,0 +1,18 @@
+/* Reset de base */
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: Inter, system-ui, sans-serif;
+  background: #f5f7fb;
+  color: #0b1324;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Liens par défaut */
+a {
+  color: inherit;
+  text-decoration: none;
+}

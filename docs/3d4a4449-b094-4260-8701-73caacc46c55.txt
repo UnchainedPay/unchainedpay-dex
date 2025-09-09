@@ -1,0 +1,560 @@
+// worker.js — UnchainedPay API (PEPU V2) + SWR + stale-if-error + retries + nocache + CRON PREWARM
+// Format: Cloudflare Workers (modules)
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const url  = new URL(request.url);
+      const path = url.pathname.replace(/\/+$/, "");
+      const qp   = url.searchParams;
+      const BYPASS = url.searchParams.has("nocache"); // ?nocache=1 => pas de lecture/écriture cache
+
+      // ====== ENV & Defaults ======
+      const EXPLORER   = (env?.EXPLORER_URL || "https://explorer-pepu-v2-mainnet-0.t.conduit.xyz").replace(/\/+$/,"");
+      const GECKO_NET  = (env?.GECKO_NET || "pepe-unchained").trim();
+      const SELF_BASE  = (env?.SELF_BASE || "https://unchainedpay-api.u5763870533.workers.dev").replace(/\/+$/,"");
+
+      // ====== CORS ======
+      const CORS = {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET,OPTIONS",
+        "access-control-allow-headers": "Content-Type,Accept",
+      };
+      if (request.method === "OPTIONS") {
+        return new Response(null, { headers: CORS });
+      }
+
+      // ====== ROOT ======
+      if (path === "" || path === "/") {
+        return json({ ok: true, name: "UnchainedPay Worker API (PEPU)" }, CORS);
+      }
+
+      // =====================================================================
+      // TOKENS (liste) — Blockscout v2 /tokens
+      // =====================================================================
+      if (path === "/tokens/discover" || path === "/tokens") {
+        const limit = clampInt(qp.get("limit"), 1, 500, 100);
+        const page  = clampInt(qp.get("page"),  1, 999999, 1);
+        const api   = `${EXPLORER}/api/v2/tokens?type=${encodeURIComponent("ERC-20,ERC-721,ERC-1155")}&limit=${limit}&page=${page}`;
+
+        // Cache policy
+        const MAX_AGE_MS = 5*60*1000;      // 5 min frais
+        const SWR_MS     = 24*60*60*1000;  // tolérance stale 24h
+        const headers = BYPASS
+          ? { ...CORS, "Cache-Control":"no-store" }
+          : { ...CORS, "Cache-Control":"public, max-age=300, stale-while-revalidate=86400" };
+
+        const cache = caches.default;
+        const cacheKey = new Request(request.url, request);
+        let cached = null;
+
+        if (!BYPASS) {
+          cached = await cache.match(cacheKey);
+          if (cached) {
+            const age = cacheAgeMs(cached);
+            if (age < MAX_AGE_MS) return cached;
+            if (age < SWR_MS) {
+              // SWR: rafraîchir en arrière-plan
+              ctx.waitUntil((async () => {
+                const outFresh = await fetchExplorerTokenList(api, /*useCf*/true, /*ttlSec*/300);
+                if (outFresh.length) {
+                  const resFresh = json({ ok:true, items: outFresh.slice(0, limit) }, {
+                    ...headers, "x-cache-time": String(Date.now())
+                  });
+                  await cache.put(cacheKey, resFresh.clone());
+                }
+              })());
+              return cached; // sert le stale
+            }
+          }
+        }
+
+        // Fetch "fresh" avec stale-if-error et anti-cache vide
+        try {
+          const out = await fetchExplorerTokenList(api, /*useCf*/true, /*ttlSec*/300);
+          const res = json({ ok:true, items: out.slice(0, limit) }, {
+            ...headers, "x-cache-time": String(Date.now())
+          });
+          if (!BYPASS && out.length) ctx.waitUntil(cache.put(cacheKey, res.clone()));
+          return res;
+        } catch (e) {
+          if (cached) return cached; // stale-if-error
+          return json({ ok:false, error: String(e?.message || e) }, CORS, 502);
+        }
+      }
+
+      // =====================================================================
+      // WALLET — pas de cache edge (on veut du frais)
+      // =====================================================================
+      if (path === "/wallet" || path.startsWith("/wallet/")) {
+        const address = (path.startsWith("/wallet/") ? path.split("/")[2] : (qp.get("address") || "")).toLowerCase();
+        if (!isAddr(address)) return bad(`Invalid address`);
+        const api1 = `${EXPLORER}/api?module=account&action=tokenlist&address=${address}`;
+        const api2 = `${EXPLORER}/api/v2/addresses/${address}/tokens?type=ERC-20&limit=200`;
+
+        const items = await fetchWalletTokens(api1, api2);
+        return json({ ok: true, items }, CORS);
+      }
+
+      // =====================================================================
+      // MARKET (prix / MC / vol24h / Δ24h) — GeckoTerminal
+      // =====================================================================
+      if (path.startsWith("/market/")) {
+        const token = path.split("/")[2]?.toLowerCase();
+        if (!isAddr(token)) return bad(`Invalid token`);
+
+        const MAX_AGE_MS = 15*1000;    // 15s
+        const SWR_MS     = 10*60*1000; // 10min
+        const headers = BYPASS
+          ? { ...CORS, "Cache-Control":"no-store" }
+          : { ...CORS, "Cache-Control":"public, max-age=15, stale-while-revalidate=600" };
+
+        const cache = caches.default;
+        const cacheKey = new Request(request.url, request);
+        let cached = null;
+
+        if (!BYPASS) {
+          cached = await cache.match(cacheKey);
+          if (cached) {
+            const age = cacheAgeMs(cached);
+            if (age < MAX_AGE_MS) return cached;
+            if (age < SWR_MS) {
+              ctx.waitUntil(refreshMarket(cache, cacheKey, headers, GECKO_NET, token));
+              return cached;
+            }
+          }
+        }
+
+        try {
+          const fresh = await fetchMarket(GECKO_NET, token, /*ttlSec*/15);
+          const a = fresh?.data?.attributes || {};
+          const valid = isFiniteNum(a.price_usd) || isFiniteNum(a.fdv_usd) || isFiniteNum(a.market_cap_usd);
+          const res = json({ ok:true, ...fresh }, { ...headers, "x-cache-time": String(Date.now()) });
+          if (!BYPASS && valid) ctx.waitUntil(cache.put(cacheKey, res.clone())); // pas de cache si réponse douteuse
+          return res;
+        } catch (e) {
+          if (cached) return cached; // stale-if-error
+          return json({ ok:false, error: String(e?.message || e) }, CORS, 502);
+        }
+      }
+
+      // =====================================================================
+      // POOLS (Top pools) — GeckoTerminal
+      // =====================================================================
+      if (path.startsWith("/pools/")) {
+        const token = path.split("/")[2]?.toLowerCase();
+        if (!isAddr(token)) return bad(`Invalid token`);
+
+        const MAX_AGE_MS = 45*1000;    // 45s
+        const SWR_MS     = 10*60*1000; // 10min
+        const headers = BYPASS
+          ? { ...CORS, "Cache-Control":"no-store" }
+          : { ...CORS, "Cache-Control":"public, max-age=45, stale-while-revalidate=600" };
+
+        const cache = caches.default;
+        const cacheKey = new Request(request.url, request);
+        let cached = null;
+
+        if (!BYPASS) {
+          cached = await cache.match(cacheKey);
+          if (cached) {
+            const age = cacheAgeMs(cached);
+            if (age < MAX_AGE_MS) return cached;
+            if (age < SWR_MS) {
+              ctx.waitUntil(refreshPools(cache, cacheKey, headers, GECKO_NET, token));
+              return cached;
+            }
+          }
+        }
+
+        try {
+          const pools = await fetchPools(GECKO_NET, token, /*ttlSec*/45);
+          const res = json({ ok:true, pools }, { ...headers, "x-cache-time": String(Date.now()) });
+          if (!BYPASS && pools.length) ctx.waitUntil(cache.put(cacheKey, res.clone())); // anti cache-vide
+          return res;
+        } catch (e) {
+          if (cached) return cached; // stale-if-error
+          return json({ ok:false, error: String(e?.message || e) }, CORS, 502);
+        }
+      }
+
+      // =====================================================================
+      // HOLDERS & SUPPLY — Blockscout /api/v2/tokens/:token
+      // =====================================================================
+      if (path.startsWith("/holders/") || path.startsWith("/supply/")) {
+        const token = path.split("/")[2]?.toLowerCase();
+        if (!isAddr(token)) return bad(`Invalid token`);
+
+        const MAX_AGE_MS = 10*60*1000;     // 10min
+        const SWR_MS     = 24*60*60*1000;  // 24h
+        const headers = BYPASS
+          ? { ...CORS, "Cache-Control":"no-store" }
+          : { ...CORS, "Cache-Control":"public, max-age=600, stale-while-revalidate=86400" };
+
+        const cache = caches.default;
+        const cacheKey = new Request(request.url, request);
+        let cached = null;
+
+        if (!BYPASS) {
+          cached = await cache.match(cacheKey);
+          if (cached) {
+            const age = cacheAgeMs(cached);
+            if (age < MAX_AGE_MS) return cached;
+            if (age < SWR_MS) {
+              ctx.waitUntil(refreshSupplyHolders(cache, cacheKey, headers, EXPLORER, path, token));
+              return cached;
+            }
+          }
+        }
+
+        try {
+          const data = await fetchSupplyHolders(EXPLORER, token);
+          const res = path.startsWith("/holders/")
+            ? json({ ok:true, holders: data.holders }, { ...headers, "x-cache-time": String(Date.now()) })
+            : json({ ok:true, supplyTotal: data.total, supplyCirc: data.circ, decimals: data.decimals }, { ...headers, "x-cache-time": String(Date.now()) });
+
+          // condition de validité simple : au moins un champ significatif non null
+          const valid = data.holders != null || data.total != null || data.circ != null;
+          if (!BYPASS && valid) ctx.waitUntil(cache.put(cacheKey, res.clone()));
+          return res;
+        } catch (e) {
+          if (cached) return cached; // stale-if-error
+          return json({ ok:false, error: String(e?.message || e) }, CORS, 502);
+        }
+      }
+
+      // =====================================================================
+      // OHLCV (candles) — GeckoTerminal (pour chart custom)
+      //  >>> AUCUN CACHE côté Worker (no-store) et PAS DE PREWARM <<<
+      // =====================================================================
+      if (path.startsWith("/ohlcv/")) {
+        const token = path.split("/")[2]?.toLowerCase();
+        const interval = qp.get("interval") || "1h";
+        const limit = clampInt(qp.get("limit"), 1, 1000, 600);
+        if (!isAddr(token)) return bad(`Invalid token`);
+
+        try {
+          const candles = await fetchOHLCV(GECKO_NET, token, interval, limit, /*ttlSec vers source*/120);
+          return json(
+            { ok:true, interval, candles },
+            { ...CORS, "Cache-Control":"no-store", "x-cache-time": String(Date.now()) }
+          );
+        } catch (e) {
+          return json({ ok:false, error: String(e?.message || e) }, CORS, 502);
+        }
+      }
+
+      // ---- Not Found ----
+      return json({ ok:false, error:"Not Found" }, CORS, 404);
+
+    } catch (e) {
+      return json({ ok:false, error: String(e?.message || e) }, { "access-control-allow-origin": "*" }, 500);
+    }
+  },
+
+  // ========================= CRON PREWARM =========================
+  // Ajoute un Cron Trigger Cloudflare (ex: */5 * * * *).
+  async scheduled(event, env, ctx) {
+    const EXPLORER   = (env?.EXPLORER_URL || "https://explorer-pepu-v2-mainnet-0.t.conduit.xyz").replace(/\/+$/,"");
+    const GECKO_NET  = (env?.GECKO_NET || "pepe-unchained").trim();
+    const SELF_BASE  = (env?.SELF_BASE || "https://unchainedpay-api.u5763870533.workers.dev").replace(/\/+$/,"");
+    const LIMIT      = Number(env?.PREWARM_LIMIT ?? 24);          // nb max de tokens à pré-chauffer
+    const WHITELIST  = String(env?.PREWARM_TOKENS || "")
+                        .split(",").map(s=>s.trim().toLowerCase()).filter(isAddr);
+
+    // 1) Liste tokens explorer
+    let explorerTokens = [];
+    try {
+      explorerTokens = await fetchExplorerTokenList(
+        `${EXPLORER}/api/v2/tokens?type=${encodeURIComponent("ERC-20,ERC-721,ERC-1155")}&limit=300&page=1`,
+        true, 300
+      );
+    } catch {}
+
+    // 2) Trending Gecko -> adresses
+    let trending = [];
+    try {
+      const j = await fetchJSONRetry(
+        `https://api.geckoterminal.com/api/v2/networks/${GECKO_NET}/trending_pools?include=base_token,quote_token`,
+        { headers:{ accept:"application/json" }, cf:{ cacheTtl: 60, cacheEverything: true } },
+        1, 200
+      );
+      const arr = Array.isArray(j?.data) ? j.data : [];
+      const set = new Set();
+      for (const p of arr) {
+        const a = p?.attributes || {};
+        [a.base_token_address, a.quote_token_address].forEach(ad=>{
+          if (isAddr(ad)) set.add(ad.toLowerCase());
+        });
+      }
+      trending = [...set].map(a=>({ address:a, symbol:"TKN", name:"Token" }));
+    } catch {}
+
+    // 3) Union + cap
+    const union = new Map();
+    const addList = (L)=>L.forEach(t=>{ const a=t.address?.toLowerCase(); if (isAddr(a) && !union.has(a)) union.set(a, t); });
+    addList(WHITELIST.map(a=>({address:a})));
+    addList(trending);
+    addList(explorerTokens);
+    const hot = [...union.keys()].slice(0, Math.max(1, LIMIT));
+
+    // 4) Pré-chauffe tokens list elle-même
+    ctx.waitUntil(fetch(`${SELF_BASE}/tokens/discover?limit=200&page=1`).catch(()=>{}));
+
+    // 5) Pré-chauffe les endpoints DONNÉES AFFICHÉES (market, pools, holders, supply)
+    await runLimited(hot, 6, async (addr) => {
+      // market (15s TTL) — écrit dans le cache edge via la route
+      await fetch(`${SELF_BASE}/market/${addr}`).catch(()=>{});
+      // pools (45s)
+      await fetch(`${SELF_BASE}/pools/${addr}`).catch(()=>{});
+      // holders + supply (10 min)
+      await fetch(`${SELF_BASE}/holders/${addr}`).catch(()=>{});
+      await fetch(`${SELF_BASE}/supply/${addr}`).catch(()=>{});
+      // NOTE: pas de /ohlcv ici (chart non-cachée)
+    });
+  }
+};
+
+// ========== Helpers ==========
+
+function json(obj, headers={}, status=200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", ...headers }
+  });
+}
+function bad(msg){ return json({ ok:false, error:msg }, { "access-control-allow-origin":"*" }, 400); }
+function clampInt(v, min, max, def) {
+  const n = parseInt(v, 10);
+  if (Number.isFinite(n)) return Math.min(max, Math.max(min, n));
+  return def;
+}
+function int(v, def=0){ const n = parseInt(v, 10); return Number.isFinite(n) ? n : def; }
+function num(v, def=0){ const n = Number(v); return Number.isFinite(n) ? n : def; }
+function isFiniteNum(v){ const n = Number(v); return Number.isFinite(n); }
+function isAddr(a){ return /^0x[0-9a-fA-F]{40}$/.test((a||"").trim()); }
+function cacheAgeMs(response){
+  const ts = Number(response.headers.get("x-cache-time") || 0);
+  return Math.max(0, Date.now() - ts);
+}
+
+// Concurrency limiter (simple)
+async function runLimited(items, concurrency, worker){
+  const q = items.slice();
+  const runners = Array.from({length: Math.max(1, concurrency)}, async function run(){
+    while(q.length){
+      const x = q.shift();
+      try{ await worker(x); }catch{}
+      // petite pause pour lisser la charge (évite 429)
+      await new Promise(r=>setTimeout(r, 150));
+    }
+  });
+  await Promise.all(runners);
+}
+
+// ---- Fetch JSON avec retries et backoff ----
+async function fetchJSONRetry(url, opts={}, retries=2, backoff=300){
+  try{
+    const r = await fetch(url, opts);
+    if (!r.ok) throw new Error("HTTP "+r.status);
+    return await r.json();
+  }catch(e){
+    if (retries > 0){
+      await new Promise(res => setTimeout(res, backoff));
+      return fetchJSONRetry(url, opts, retries-1, backoff*2);
+    }
+    throw e;
+  }
+}
+
+// ---- Transformations Explorer ----
+async function fetchExplorerTokenList(apiUrl, useCfCache=false, ttlSec=300) {
+  try {
+    const j = await fetchJSONRetry(apiUrl, {
+      headers: { accept: "application/json" },
+      ...(useCfCache ? { cf: { cacheTtl: ttlSec, cacheEverything: true } } : {})
+    });
+    const arr =
+      Array.isArray(j?.items) ? j.items :
+      Array.isArray(j?.result) ? j.result :
+      Array.isArray(j)         ? j : [];
+    const out = [];
+    const seen = new Set();
+    for (const it of arr) {
+      const t = it?.token || it;
+      const address = (t?.address || t?.address_hash || t?.contract_address || t?.contractAddress || t?.contract || "").toLowerCase();
+      if (!isAddr(address) || seen.has(address)) continue;
+      seen.add(address);
+      out.push({ address, symbol: t?.symbol || "TKN", name: t?.name || t?.symbol || "Token" });
+    }
+    return out;
+  } catch { return []; }
+}
+
+// ---- Wallet tokens (pas de cache edge pour rester frais) ----
+async function fetchWalletTokens(api1, api2) {
+  let items = [];
+  try {
+    const j1 = await fetchJSONRetry(api1, { headers:{ accept:"application/json" }, cf:{ cacheTtl: 15, cacheEverything:true } }, 1, 250);
+    const arr = Array.isArray(j1?.result) ? j1.result : [];
+    items = arr.map(t=>({
+      address: (t.contractAddress||t.contract||"").toLowerCase(),
+      name: t.name || "Token",
+      symbol: t.symbol || "TKN",
+      decimals: int(t.decimals, 18),
+      balance: String(t.balance ?? "0")
+    })).filter(x=>isAddr(x.address));
+  } catch {}
+
+  if (!items.length) {
+    try {
+      const j2 = await fetchJSONRetry(api2, { headers:{ accept:"application/json" }, cf:{ cacheTtl: 15, cacheEverything:true } }, 1, 250);
+      const arr = Array.isArray(j2?.items) ? j2.items : [];
+      items = arr.map(it=>{
+        const t = it?.token || it;
+        return {
+          address: (t?.address||t?.contract_address||"").toLowerCase(),
+          name: t?.name || "Token",
+          symbol: t?.symbol || "TKN",
+          decimals: int(t?.decimals, 18),
+          balance: String(it?.value ?? it?.balance ?? "0")
+        };
+      }).filter(x=>isAddr(x.address));
+    } catch {}
+  }
+  return items;
+}
+
+// ---- Market enrichi (prix/MC conservés, vol & Δ ajoutés si manquants)
+async function fetchMarket(GECKO_NET, token, ttlSec = 15) {
+  // Token (source principale)
+  const payload = await fetchJSONRetry(
+    `https://api.geckoterminal.com/api/v2/networks/${GECKO_NET}/tokens/${token}`,
+    { headers: { accept: "application/json" }, cf: { cacheTtl: ttlSec, cacheEverything: true } }
+  );
+  const a = payload?.data?.attributes || {};
+
+  // Tenter vol/Δ via token
+  let vol24 = a.volume_usd_24h ?? a.volume_usd?.h24 ?? a.h24_volume_usd ?? null;
+  let d24   = a.price_percent_change_24h ?? a.price_change_percentage?.h24 ?? a.h24_price_change_percentage ?? null;
+
+  // Si manquants, top pool
+  if (vol24 == null || d24 == null) {
+    try {
+      const pj = await fetchJSONRetry(
+        `https://api.geckoterminal.com/api/v2/networks/${GECKO_NET}/tokens/${token}/pools`,
+        { headers:{ accept:"application/json" }, cf:{ cacheTtl: 45, cacheEverything: true } },
+        1, 300
+      );
+      const pa = pj?.data?.[0]?.attributes || {};
+      if (vol24 == null) vol24 = pa.volume_usd_24h ?? pa.volume_usd?.h24 ?? pa.h24_volume_usd ?? null;
+      if (d24   == null) d24   = pa.price_percent_change_24h ?? pa.price_change_percentage?.h24 ?? pa.h24_price_change_percentage ?? null;
+    } catch {}
+  }
+
+  // Aplatir ces deux champs si absents
+  if (payload?.data?.attributes) {
+    if (vol24 != null && payload.data.attributes.volume_usd_24h == null) {
+      const n = Number(vol24); if (Number.isFinite(n)) payload.data.attributes.volume_usd_24h = n;
+    }
+    if (d24 != null && payload.data.attributes.price_percent_change_24h == null) {
+      const n = Number(d24); if (Number.isFinite(n)) payload.data.attributes.price_percent_change_24h = n;
+    }
+  }
+  return payload;
+}
+
+async function refreshMarket(cache, cacheKey, headers, GECKO_NET, token){
+  try{
+    const fresh = await fetchMarket(GECKO_NET, token, /*ttlSec*/15);
+    const a = fresh?.data?.attributes || {};
+    const valid = isFiniteNum(a.price_usd) || isFiniteNum(a.fdv_usd) || isFiniteNum(a.market_cap_usd);
+    if (!valid) return;
+    const res = json({ ok:true, ...fresh }, { ...headers, "x-cache-time": String(Date.now()) });
+    await cache.put(cacheKey, res.clone());
+  }catch{/* ignore */}
+}
+
+async function fetchPools(GECKO_NET, token, ttlSec=45){
+  const j = await fetchJSONRetry(
+    `https://api.geckoterminal.com/api/v2/networks/${GECKO_NET}/tokens/${token}/pools`,
+    { headers: { accept: "application/json" }, cf: { cacheTtl: ttlSec, cacheEverything: true } }
+  );
+  const pools = (Array.isArray(j?.data) ? j.data : []).map(p => {
+    const a = p?.attributes || {};
+    return {
+      address: (a?.address || a?.pool_address || "").toLowerCase(),
+      dex: a?.dex || a?.name || "Pool",
+      liq: num(a?.reserve_in_usd ?? a?.reserve_usd ?? a?.liquidity_usd),
+    };
+  });
+  return pools;
+}
+async function refreshPools(cache, cacheKey, headers, GECKO_NET, token){
+  try{
+    const pools = await fetchPools(GECKO_NET, token, /*ttlSec*/45);
+    if (!pools.length) return;
+    const res = json({ ok:true, pools }, { ...headers, "x-cache-time": String(Date.now()) });
+    await cache.put(cacheKey, res.clone());
+  }catch{/* ignore */}
+}
+
+async function fetchSupplyHolders(EXPLORER, token){
+  const j = await fetchJSONRetry(`${EXPLORER}/api/v2/tokens/${token}`, {
+    headers: { accept: "application/json" },
+    cf: { cacheTtl: 600, cacheEverything: true }
+  });
+  const a = j?.token || j?.data || j || {};
+  const decimals = int(a.decimals, 18);
+  const total = toFloat(a.total_supply, decimals);
+  const circ  = toFloat(a.circulating_supply ?? a.total_supply, decimals);
+  const holders = int(a.holders_count ?? a.holder_count ?? a.holders, null);
+  return { decimals, total, circ, holders };
+}
+async function refreshSupplyHolders(cache, cacheKey, headers, EXPLORER, path, token){
+  try{
+    const data = await fetchSupplyHolders(EXPLORER, token);
+    const valid = data.holders != null || data.total != null || data.circ != null;
+    if (!valid) return;
+    const res = path.startsWith("/holders/")
+      ? json({ ok:true, holders: data.holders }, { ...headers, "x-cache-time": String(Date.now()) })
+      : json({ ok:true, supplyTotal: data.total, supplyCirc: data.circ, decimals: data.decimals }, { ...headers, "x-cache-time": String(Date.now()) });
+    await cache.put(cacheKey, res.clone());
+  }catch{/* ignore */}
+}
+
+async function fetchOHLCV(GECKO_NET, token, interval, limit, ttlSec=120){
+  const j = await fetchJSONRetry(
+    `https://api.geckoterminal.com/api/v2/networks/${GECKO_NET}/tokens/${token}/ohlcv/${interval}?limit=${limit}`,
+    { headers: { accept: "application/json" }, cf: { cacheTtl: ttlSec, cacheEverything: true } } // cache côté source OK; mais no-store côté réponse Worker
+  );
+  let rows = j?.data?.attributes?.ohlcv_list || j?.data?.attributes?.candles || j?.candles || [];
+  if (!Array.isArray(rows)) rows = [];
+  const candles = rows.map(x => {
+    if (Array.isArray(x)) return x;
+    const t = int(x.timestamp ?? x.time ?? x[0]);
+    return [ t, num(x.open??x[1]), num(x.high??x[2]), num(x.low??x[3]), num(x.close??x[4]), num(x.volume??x[5]) ];
+  }).filter(a => a && a.length >= 5 && a[0]);
+  return candles;
+}
+
+// conversions supply -> flottant en unités humaines
+function toFloat(v, decimals){
+  try{
+    if (v == null) return null;
+    const s = String(v);
+    if (/^\d+$/.test(s)) {
+      const pad = Math.max(0, int(decimals, 18));
+      if (pad === 0) return Number(s);
+      const len = s.length;
+      if (len <= pad) {
+        const z = "0".repeat(pad - len);
+        return Number(`0.${z}${s}`);
+      }
+      const head = s.slice(0, len - pad);
+      const tail = s.slice(len - pad);
+      return Number(`${head}.${tail}`);
+    }
+    return Number(s);
+  }catch{ return null; }
+}
