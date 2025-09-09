@@ -7,18 +7,18 @@ const EXPLORER_URL =
 function isAddr(a?: string){ return /^0x[0-9a-fA-F]{40}$/.test((a||"").trim()); }
 function i(v:any, def:number|null=0){ const n=parseInt(String(v),10); return Number.isFinite(n)?n:def; }
 
-function toFloat(v:any, decimals:number|null){
-  try{
-    if (v==null) return null;
-    const d = Math.max(0, i(decimals??18, 18));
+function toFloat(v: any, decimals: number | null | undefined) {
+  try {
+    if (v == null) return null;
+    const d = Math.max(0, Number(decimals ?? 18));
     const s = String(v);
     if (/^\d+$/.test(s)) {
-      if (d===0) return Number(s);
-      if (s.length<=d) return Number(`0.${"0".repeat(d - s.length)}${s}`);
-      return Number(`${s.slice(0, s.length-d)}.${s.slice(s.length-d)}`);
+      if (d === 0) return Number(s);
+      if (s.length <= d) return Number(`0.${"0".repeat(d - s.length)}${s}`);
+      return Number(`${s.slice(0, s.length - d)}.${s.slice(s.length - d)}`);
     }
     return Number(s);
-  }catch{ return null; }
+  } catch { return null; }
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
